@@ -31,6 +31,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/regclient/regclient/config"
+	"github.com/regclient/regclient/internal/reqmeta"
 	"github.com/regclient/regclient/internal/reqresp"
 	"github.com/regclient/regclient/types/errs"
 	"github.com/regclient/regclient/types/warning"
@@ -1810,4 +1811,53 @@ func TestRegHttp(t *testing.T) {
 	})
 
 	// TODO: test various TLS configs (custom root for all hosts, custom root for one host, insecure)
+}
+
+func TestShortReadRetryThrottle(t *testing.T) {
+	t.Parallel()
+	body := []byte("0123456789abcdefghij")
+	half := len(body) / 2
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rng := r.Header.Get("Range"); rng != "" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", half, len(body)-1, len(body)))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)-half))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[half:])
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body[:half])
+		w.(http.Flusher).Flush()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer ts.Close()
+	tsURL, _ := url.Parse(ts.URL)
+	host := &config.Host{Name: tsURL.Host, Hostname: tsURL.Host, TLS: config.TLSDisabled, ReqConcurrent: 1}
+	hc := NewClient(
+		WithConfigHostFn(func(string) *config.Host { return host }),
+		WithDelay(time.Millisecond, 2*time.Millisecond),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := hc.Do(ctx, &Req{Host: tsURL.Host, Method: "GET", Repository: "project", Path: "blobs/short"})
+	if err != nil {
+		t.Fatalf("failed to run get: %v", err)
+	}
+	got, err := io.ReadAll(resp)
+	if err != nil {
+		t.Fatalf("body read failure: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("body mismatch, expected %s, received %s", body, got)
+	}
+	_ = resp.Close()
+	done, err := hc.GetThrottle(tsURL.Host).TryAcquire(ctx, reqmeta.Data{})
+	if err != nil || done == nil {
+		t.Fatalf("throttle slot not released after close: %v", err)
+	}
+	done()
 }

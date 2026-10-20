@@ -260,6 +260,11 @@ func (resp *Resp) next() error {
 	var err error
 	c := resp.client
 	req := resp.req
+	// release the throttle held by a previous response before a retry acquires a new one
+	if resp.throttleDone != nil {
+		resp.throttleDone()
+		resp.throttleDone = nil
+	}
 	// lookup reqHost entry
 	reqHost := c.getHost(req.Host)
 	// create sorted list of mirrors, based on backoffs, upstream, and priority
